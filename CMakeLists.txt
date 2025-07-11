@@ -9,6 +9,7 @@ aux_source_directory(./src SERVER_LIST)
 include_directories(./include)
 # 第一个变量：要生成的可执行文件名为server，后面的参数是需要的依赖 可以有多个 空格分割
 add_executable(server server.cpp ${SERVER_LIST})
+add_executable(client client.cpp ${SERVER_LIST})
 
 # 添加编译选项
 add_compile_options(-std=c++11 -Wall -O0 -g)
