@@ -169,7 +169,9 @@ static int accept_new_conn(std::vector<Conn *> &fd2conn, int epfd, int fd) {
     conn->fd = connfd;
     conn->state = ConnState::STATE_REQ;
     conn->rbuf_size = 0;
+    conn->rbuf_start = 0;
     conn->wbuf_size = 0;
+    conn->wbuf_start = 0;
     conn->wbuf_sent = 0;
     conn_put(fd2conn, conn);
 
@@ -247,77 +249,104 @@ static int32_t do_request(const uint8_t *req, uint32_t reqlen, ResState &rescode
 }
 
 static bool try_flush_buffer(Conn *conn) {
+    if (conn->wbuf_size == conn->wbuf_sent) {
+        // 没有数据需要发送
+        return false;
+    }
+
     ssize_t rv = 0;
     size_t remain = conn->wbuf_size - conn->wbuf_sent;
-    rv = write(conn->fd, &conn->wbuf[conn->wbuf_sent], remain);
+
+    // 计算连续可发送的数据长度
+    size_t read_pos = (conn->wbuf_start + conn->wbuf_sent) % sizeof(conn->wbuf);
+    size_t continuous_data = sizeof(conn->wbuf) - read_pos;
+    size_t to_send = (remain < continuous_data) ? remain : continuous_data;
+
+    rv = write(conn->fd, &conn->wbuf[read_pos], to_send);
     if (rv < 0 && errno == EAGAIN) {
         // 遇到EAGAIN 停止写入
         return false;
     }
     if (rv < 0) {
         REDIS_LOG(LogLevel::ERROR, "write() failed");
+        conn->state = ConnState::STATE_END;
         return false;
     }
 
-    conn->wbuf_sent += (size_t)rv;
-    assert(conn->wbuf_sent <= conn->wbuf_size);
-    if (conn->wbuf_sent == conn->wbuf_size) {
-        // 响应已经发送完毕，切换会REQ状态
+    // 更新已发送的数据量
+    wbuf_consume(conn, (size_t)rv);
+
+    if (conn->wbuf_size == 0) {
+        // 响应已经发送完毕，切换回REQ状态
         conn->state = ConnState::STATE_REQ;
-        conn->wbuf_sent = 0;
-        conn->wbuf_size = 0;
         return false;
     }
-    
+
     // 写缓冲区还有数据 可以试着继续写入
     return true;
 }
 
 static bool try_one_request(Conn *conn) {
-    // 尝试从缓冲区里解析出一个请求
+    // 尝试从环形缓冲区里解析出一个请求
     if (conn->rbuf_size < 4) {
         // 缓冲区数据不够，下次试试
         return false;
     }
 
+    // 先读取长度字段，但不消费数据
     uint32_t len = 0;
-    memcpy(&len, &conn->rbuf[0], 4);
+    if (conn->rbuf_start + 4 > sizeof(conn->rbuf)) {
+        // 长度字段跨边界
+        size_t n1 = sizeof(conn->rbuf) - conn->rbuf_start;
+        memcpy(&len, &conn->rbuf[conn->rbuf_start], n1);
+        memcpy((char*)&len + n1, &conn->rbuf[0], 4 - n1);
+    } else {
+        memcpy(&len, &conn->rbuf[conn->rbuf_start], 4);
+    }
+
     if (len > k_max_msg) {
         REDIS_LOG(LogLevel::WARN, "request is too long");
         conn->state = ConnState::STATE_END;
         return false;
     }
 
-    if(len + 4 > conn->rbuf_size) {
+    if (len + 4 > conn->rbuf_size) {
         // 缓冲区数据不够 下次循环再试试
         return false;
     }
 
-    // 拿到一个请求 处理一下
+    // 现在真正消费长度字段
+    read_from_rbuf(conn, (char*)&len, 4);
+
+    // 读取请求数据到临时缓冲区
+    char req_buf[k_max_msg];
+    read_from_rbuf(conn, req_buf, len);
+
     // 生成响应
     ResState rescode = ResState::RES_OK;
     uint32_t wlen = 0;
-    int32_t err = do_request(&conn->rbuf[4], len, rescode, &conn->wbuf[4 + 4], wlen);
+    char res_buf[k_max_msg];
+    int32_t err = do_request((uint8_t*)req_buf, len, rescode, (uint8_t*)res_buf, wlen);
     if (err < 0) {
-        REDIS_LOG(LogLevel::ERROR, "write buffer is not enough");
+        REDIS_LOG(LogLevel::ERROR, "request processing failed");
         conn->state = ConnState::STATE_END;
         return true;
     } else {
         rescode = (ResState)err;
     }
 
-    wlen += 4;
-    memcpy(&conn->wbuf[0], &wlen, 4);
-    memcpy(&conn->wbuf[4], &rescode, 4);
-    conn->wbuf_size = 4 + wlen;
-
-    // 从缓冲区里移除这个请求
-    // 为了方便使用memmove 实际最好使用环形缓冲区
-    size_t remain = conn->rbuf_size - 4 - len;
-    if (remain > 0) {
-        memmove(conn->rbuf, &conn->rbuf[4+len], remain);
+    // 将响应写入写缓冲区
+    uint32_t total_len = wlen + 4;
+    if (wbuf_available_space(conn) < total_len + 4) {
+        REDIS_LOG(LogLevel::ERROR, "write buffer is not enough");
+        conn->state = ConnState::STATE_END;
+        return true;
     }
-    conn->rbuf_size = remain;
+
+    // 写入响应长度和状态码
+    write_to_wbuf(conn, (char*)&total_len, 4);
+    write_to_wbuf(conn, (char*)&rescode, 4);
+    write_to_wbuf(conn, res_buf, wlen);
 
     // 状态转换为写状态
     conn->state = ConnState::STATE_RES;
@@ -328,18 +357,28 @@ static bool try_one_request(Conn *conn) {
 }
 
 static bool try_fill_buffer(Conn *conn) {
-    // 尝试填充缓冲区
+    // 尝试填充环形缓冲区
     assert(conn->rbuf_size < sizeof(conn->rbuf));
+
+    size_t available = rbuf_available_space(conn);
+    if (available == 0) {
+        return false;  // 缓冲区已满
+    }
+
     ssize_t rv = 0;
     do {
-        size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
-        rv = read(conn->fd, &conn->rbuf[conn->rbuf_size], cap);
+        // 计算连续可写入的空间
+        size_t write_pos = (conn->rbuf_start + conn->rbuf_size) % sizeof(conn->rbuf);
+        size_t continuous_space = sizeof(conn->rbuf) - write_pos;
+        size_t to_read = (available < continuous_space) ? available : continuous_space;
+
+        rv = read(conn->fd, &conn->rbuf[write_pos], to_read);
     } while (rv < 0 && errno == EINTR);
+
     // EINTR : 系统调用被信号中断（如 read() 被用户按下 Ctrl+C 终止）
     // EAGAIN: 资源暂时不可用（非阻塞调用需重试，如 read() 无数据）
     if (rv < 0 && errno == EAGAIN) {
         // 遇到了EAGAIN 停止读取
-        // REDIS_LOG(LogLevel::DEBUG, "try_fill_buffer: %s", strerror(errno));
         return false;
     }
 
@@ -360,7 +399,7 @@ static bool try_fill_buffer(Conn *conn) {
     }
 
     conn->rbuf_size += (size_t)rv;
-    assert(conn->rbuf_size < sizeof(conn->rbuf));
+    assert(conn->rbuf_size <= sizeof(conn->rbuf));
 
     // 尝试逐个处理请求
     while (try_one_request(conn)) {}
